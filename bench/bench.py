@@ -1,5 +1,5 @@
 # import matplotlib.pyplot as plt
-from deap import gp
+from deap import gp, base
 
 from flex.gp import regressor as gps
 from flex.gp.util import (
@@ -26,9 +26,7 @@ from mygrad._utils.lock_management import mem_guard_off
 from functools import partial
 
 import optuna
-
-num_cpus = 1
-num_runs = 1  # 20
+import sympy as sp
 
 
 def check_trig_fn(ind):
@@ -60,6 +58,78 @@ def compute_MSE(individual, X, y, consts=[]):
     return MSE
 
 
+def sanitize_array_for_metrics(arr, name, clip_value=1e150):
+    """Return a finite float64 array suitable for metric computation."""
+    arr = np.asarray(arr, dtype=np.float64).reshape(-1)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=clip_value, neginf=-clip_value)
+    arr = np.clip(arr, -clip_value, clip_value)
+    return arr
+
+
+def safe_r2_score(y_true, y_pred):
+    """Robust R^2 computation that avoids crashing on bad numeric values."""
+    try:
+        return r2_score(y_true, y_pred)
+    except ValueError as exc:
+        print(f"Warning: r2_score failed ({exc}). Returning NaN.")
+        return np.nan
+
+
+def gaussian_iid_negative_log_likelihood(mse, n_samples):
+    """Total Gaussian i.i.d. negative log-likelihood with MLE variance."""
+    eps = 1e-12
+    sigma2 = max(mse, eps)
+    n = max(int(n_samples), 1)
+    return 0.5 * n * (np.log(2.0 * np.pi * sigma2) + 1.0)
+
+
+def bic_gaussian_iid(mse, n_samples, model_size):
+    """Bayesian Information Criterion under Gaussian i.i.d. residuals."""
+    nll = gaussian_iid_negative_log_likelihood(mse, n_samples)
+    n = max(int(n_samples), 2)
+    k = max(int(model_size), 1)
+    return 2.0 * nll + k * np.log(n)
+
+
+def compute_fitness_value(MSE, n_samples, model_size, penalty):
+    # Evolution fitness: only MSE + linear size regularization.
+    # BIC is reserved for optional final model selection at the end.
+    return MSE + penalty["reg_param"] * model_size
+
+
+def select_best_model_by_bic(estimator, pset, X, y):
+    """
+    Select best individual in the final population using BIC.
+
+    This is intended for end-of-evolution model selection only.
+    """
+    toolbox = base.Toolbox()
+    toolbox.register("compile", gp.compile, pset=pset)
+
+    best = None
+    best_bic = np.inf
+
+    for ind in estimator.get_population_individuals():
+        consts = getattr(ind, "consts", [])
+        if consts is None:
+            continue
+        callable, _ = compile_individual_with_consts(ind, toolbox)
+        mse = compute_MSE(callable, X, y, consts=consts)
+        model_size = len(ind) + len(consts)
+        bic = bic_gaussian_iid(mse, y.shape[0], model_size)
+        if bic < best_bic:
+            best_bic = bic
+            best = ind
+
+    if best is None:
+        raise RuntimeError(
+            "Unable to select a best model by BIC from final population."
+        )
+
+    estimator._best = best
+    return best, best_bic
+
+
 def eval_MSE_and_tune_constants(tree, toolbox, X, y):
     individual, num_consts = compile_individual_with_consts(tree, toolbox)
 
@@ -72,7 +142,6 @@ def eval_MSE_and_tune_constants(tree, toolbox, X, y):
         class fitting_problem:
             def fitness(self, x):
                 total_err = eval_MSE(consts=x)
-                # return [total_err + 0.*(np.linalg.norm(x, 2))**2]
                 return [total_err]
 
             def gradient(self, x):
@@ -87,10 +156,10 @@ def eval_MSE_and_tune_constants(tree, toolbox, X, y):
 
         # PYGMO SOLVER
         prb = pg.problem(fitting_problem())
-        algo = pg.algorithm(pg.nlopt(solver="lbfgs"))
-        # algo = pg.algorithm(pg.pso(gen=10))
-        # pop = pg.population(prb, size=70)
-        algo.extract(pg.nlopt).maxeval = 10
+        # algo = pg.algorithm(pg.nlopt(solver="lbfgs"))
+        algo = pg.algorithm(pg.pso(gen=10))
+        pop = pg.population(prb, size=70)
+        # algo.extract(pg.nlopt).maxeval = 10
         pop = pg.population(prb, size=1)
         pop.push_back(x0)
         pop = algo.evolve(pop)
@@ -119,7 +188,14 @@ def get_features_batch(
     return individ_length, nested_trigs, num_trigs
 
 
-def predict(individuals_batch, toolbox, X, penalty, fitness_scale):
+def predict(
+    individuals_batch,
+    toolbox,
+    X,
+    penalty,
+    fitness_scale,
+    tarpeian_length_threshold,
+):
 
     predictions = [None] * len(individuals_batch)
 
@@ -130,7 +206,15 @@ def predict(individuals_batch, toolbox, X, penalty, fitness_scale):
     return predictions
 
 
-def compute_MSEs(individuals_batch, toolbox, X, y, penalty, fitness_scale):
+def compute_MSEs(
+    individuals_batch,
+    toolbox,
+    X,
+    y,
+    penalty,
+    fitness_scale,
+    tarpeian_length_threshold,
+):
 
     total_errs = [None] * len(individuals_batch)
 
@@ -141,7 +225,15 @@ def compute_MSEs(individuals_batch, toolbox, X, y, penalty, fitness_scale):
     return total_errs
 
 
-def compute_attributes(individuals_batch, toolbox, X, y, penalty, fitness_scale):
+def compute_attributes(
+    individuals_batch,
+    toolbox,
+    X,
+    y,
+    penalty,
+    fitness_scale,
+    tarpeian_length_threshold,
+):
 
     attributes = [None] * len(individuals_batch)
 
@@ -150,20 +242,35 @@ def compute_attributes(individuals_batch, toolbox, X, y, penalty, fitness_scale)
     for i, tree in enumerate(individuals_batch):
 
         # Tarpeian selection
-        if individ_length[i] >= 50:
+        if individ_length[i] >= tarpeian_length_threshold:
             consts = None
             fitness = (1e8,)
         else:
             MSE, consts = eval_MSE_and_tune_constants(tree, toolbox, X, y)
-            fitness = (
-                fitness_scale
-                * (
-                    MSE
-                    + 100000 * nested_trigs[i]
-                    + 0.0 * num_trigs[i]
-                    + penalty["reg_param"] * individ_length[i]
-                ),
-            )
+            if MSE < 1e-12:
+                # Keep fitness equal to pure error so early stopping can trigger.
+                fitness = (fitness_scale * MSE,)
+            else:
+                num_consts = len(consts)
+                model_size = individ_length[i] + num_consts
+                age_penalty = penalty.get("age_reg_param", 0.0) * getattr(
+                    tree, "age", 0
+                )
+                fitness_value = compute_fitness_value(
+                    MSE=MSE,
+                    n_samples=y.shape[0],
+                    model_size=model_size,
+                    penalty=penalty,
+                )
+                fitness = (
+                    fitness_scale
+                    * (
+                        fitness_value
+                        + age_penalty
+                        + 100000 * nested_trigs[i]
+                        + 0.0 * num_trigs[i]
+                    ),
+                )
         attributes[i] = {"consts": consts, "fitness": fitness}
     return attributes
 
@@ -212,7 +319,14 @@ def eval(problem, cfgfile, seed=42, grid_search=False):
     fitness_scale = 1.0
 
     penalty = config_file_data["gp"]["penalty"]
-    common_params = {"penalty": penalty, "fitness_scale": fitness_scale}
+    tarpeian_length_threshold = config_file_data["gp"].get(
+        "tarpeian_length_threshold", 40
+    )
+    common_params = {
+        "penalty": penalty,
+        "fitness_scale": fitness_scale,
+        "tarpeian_length_threshold": tarpeian_length_threshold,
+    }
 
     gpsr = gps.GPSymbolicRegressor(
         pset_config=pset,
@@ -227,8 +341,9 @@ def eval(problem, cfgfile, seed=42, grid_search=False):
         output_path="./",
         seed_str=None,
         batch_size=batch_size,
-        num_cpus=num_cpus,
         remove_init_duplicates=True,
+        save_detailed_log=False,
+        early_stop_fitness_threshold=1e-12,
         **regressor_params,
     )
 
@@ -240,7 +355,7 @@ def eval(problem, cfgfile, seed=42, grid_search=False):
         }
 
         # wrap regressor inside an optuna CV search object
-        est = optuna.integration.OptunaSearchCV(
+        best_estimator = optuna.integration.OptunaSearchCV(
             gpsr,
             param,
             cv=5,
@@ -251,21 +366,44 @@ def eval(problem, cfgfile, seed=42, grid_search=False):
             timeout=3600,
         )
     else:
-        est = gpsr
+        best_estimator = gpsr
 
     tic = time.time()
-    est.fit(X_train_scaled, y_train_scaled)
+    best_estimator.fit(X_train_scaled, y_train_scaled)
     toc = time.time()
 
     if grid_search:
-        best_estimator = est.best_estimator_
+        best_estimator = best_estimator.best_estimator_
     else:
-        best_estimator = est
+        best_estimator = best_estimator
 
-    best = best_estimator.get_best_individuals(n_ind=1)[0]
+    final_model_selection = config_file_data["gp"].get(
+        "final_model_selection", "fitness"
+    )
+    if final_model_selection == "bic":
+        best_model, best_bic = select_best_model_by_bic(
+            estimator=best_estimator,
+            pset=pset,
+            X=X_train_scaled,
+            y=y_train_scaled,
+        )
+    else:
+        best_model = best_estimator.get_best_individuals(n_ind=1)[0]
 
-    if hasattr(best, "consts"):
-        print("Best parameters = ", best.consts)
+    try:
+        best_model_sympy = sp.simplify(best_estimator.get_best_individual_sympy())
+        best_model_str = str(best_model_sympy)
+    except Exception as exc:
+        print(
+            "Warning: failed to convert best model to SymPy "
+            f"({type(exc).__name__}: {exc}). "
+            "Using raw GP string instead."
+        )
+        best_model_str = str(best_model)
+    print("Best selected model = ", best_model_str)
+
+    if hasattr(best_model, "consts"):
+        print("Best parameters = ", best_model.consts)
 
     print("Elapsed time = ", toc - tic)
     individuals_per_sec = (
@@ -276,18 +414,20 @@ def eval(problem, cfgfile, seed=42, grid_search=False):
     )
     print("Individuals per sec = ", individuals_per_sec)
 
-    u_best = est.predict(X_test_scaled)
+    u_best = best_estimator.predict(X_test_scaled)
 
     # de-scale outputs before computing errors
     if scaleXy:
         u_best = scaler_y.inverse_transform(u_best.reshape(-1, 1)).flatten()
 
-    MSE = np.mean((u_best - y_test) ** 2)
-    r2_test = r2_score(y_test, u_best)
+    y_test_safe = sanitize_array_for_metrics(y_test, "y_test")
+    u_best_safe = sanitize_array_for_metrics(u_best, "u_best")
+    MSE = np.mean((u_best_safe - y_test_safe) ** 2)
+    r2_test = safe_r2_score(y_test_safe, u_best_safe)
     print("MSE on the test set = ", MSE)
     print("R^2 on the test set = ", r2_test)
 
-    pred_train = est.predict(X_train_scaled)
+    pred_train = best_estimator.predict(X_train_scaled)
 
     if scaleXy:
         pred_train = scaler_y.inverse_transform(pred_train.reshape(-1, 1)).flatten()
@@ -295,38 +435,19 @@ def eval(problem, cfgfile, seed=42, grid_search=False):
             y_train_scaled.reshape(-1, 1)
         ).flatten()
 
-    MSE = np.mean((pred_train - y_train_scaled) ** 2)
-    r2_train = r2_score(y_train_scaled, pred_train)
+    y_train_safe = sanitize_array_for_metrics(y_train_scaled, "y_train")
+    pred_train_safe = sanitize_array_for_metrics(pred_train, "pred_train")
+    MSE = np.mean((pred_train_safe - y_train_safe) ** 2)
+    r2_train = safe_r2_score(y_train_safe, pred_train_safe)
     print("MSE on the training set = ", MSE)
     print("R^2 on the training set = ", r2_train)
-    # Nguyen
-    # if MSE <= 1e-10 or (problem == "Nguyen-13" and MSE <= 1e-5):
-    #     return 1.0
-    # else:
-    #     return 0.0
 
-    return r2_train, r2_test
+    return r2_train, r2_test, best_model_str
 
 
 if __name__ == "__main__":
     import argparse
     import pathlib
-
-    # problems = [
-    #     "Nguyen-1",
-    #     "Nguyen-2",
-    #     "Nguyen-3",
-    #     "Nguyen-4",
-    #     "Nguyen-5",
-    #     "Nguyen-6",
-    #     "Nguyen-7",
-    #     "Nguyen-8",
-    #     "Nguyen-9",
-    #     "Nguyen-10",
-    #     "Nguyen-11",
-    #     "Nguyen-12",
-    #     "Nguyen-13",
-    # ]
 
     parser = argparse.ArgumentParser()
 
@@ -348,14 +469,11 @@ if __name__ == "__main__":
     problem = args.problem
     cfgfile = args.cfgfile
 
-    # problem = "1089_USCrime"
-
     seeds = [29802, 22118, 860, 15795, 21575, 5390, 11964, 6265, 23654, 11284]
 
     r2_tests = []
 
-    # possibly add rmse_train, rmse_test, rmse_val
-    header = ["problem", "trial", "r2_train", "r2_test", "seed"]
+    header = ["problem", "trial", "r2_train", "r2_test", "seed", "best_model"]
 
     with open(f"./results/{problem}.csv", "w") as f:
         for h in header:
@@ -365,7 +483,7 @@ if __name__ == "__main__":
     for i, seed in enumerate(seeds):
         print("PROBLEM: ", problem)
         print("seed: ", seed)
-        r2_train, r2_test = eval(
+        r2_train, r2_test, best_model_str = eval(
             problem=problem, cfgfile=cfgfile, seed=seed, grid_search=args.gs
         )
         r2_tests.append(r2_test)
@@ -376,6 +494,7 @@ if __name__ == "__main__":
             "r2_train": r2_train,
             "r2_test": r2_test,
             "seed": seed,
+            "best_model": best_model_str,
         }
 
         with open(f"./results/{problem}.csv", "a") as f:
@@ -386,16 +505,3 @@ if __name__ == "__main__":
     print("Median Test R^2 = ", np.median(r2_tests))
 
     ray.shutdown()
-    # Nguyen
-    # ave_success_rate = 0.0
-    # with open("bench_stats.txt", "w") as file:
-    #     for problem in problems:
-    #         success = 0.0
-    #         for i in range(num_runs):
-    #             print("Problem {prb}, RUN #{num}".format(prb=problem, num=i))
-    #             success += bench(problem=problem)
-    #         success_rate = success / num_runs * 100
-    #         ave_success_rate += success_rate / len(problems)
-    #         str_to_print = problem + " " + str(success_rate)
-    #         print(str_to_print, file=file, flush=True)
-    #     print("Average success rate = ", ave_success_rate)

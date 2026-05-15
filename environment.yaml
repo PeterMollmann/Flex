@@ -18,7 +18,6 @@ dependencies:
   - typeguard
   - yaml
   - pygraphviz
-  - petsc
   - petsc4py
   - pip
   - pip:

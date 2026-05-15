@@ -2,6 +2,7 @@ from deap import algorithms, tools, gp, base, creator
 from deap.tools import migRing
 import numpy as np
 import operator
+import csv
 from typing import List, Dict, Callable
 from os.path import join
 import os
@@ -17,7 +18,6 @@ from functools import partial
 from itertools import chain
 import numpy.typing as npt
 from jax import Array
-
 
 # reducing the number of threads launched by fitness evaluations
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -74,6 +74,8 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         mig_frac: fraction of individuals exchanged during migration.
         crossover_prob: probability of applying crossover.
         mut_prob: probability of applying mutation.
+        variation_mechanism: variation operator used to generate offspring.
+            Supported values are ``"varAnd"`` and ``"varOr"``.
         frac_elitist: fraction of elite individuals preserved each generation.
         overlapping_generation: True if the offspring competes with the parents
             for survival.
@@ -95,6 +97,11 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         save_best_individual: whether to save the string representation of the best
             individual.
         save_train_fit_history: whether to save the training fitness history.
+        save_detailed_log: whether to save a per-generation population log with
+            each individual string, size, fitness, and island index.
+        detailed_log_filename: file name used for detailed population logging.
+        early_stop_fitness_threshold: if set, stop evolution early when the best
+            training fitness is less than or equal to this threshold.
         output_path: directory where outputs are saved.
         batch_size : batch size used for Ray-based fitness evaluation.
         num_cpus: number of CPUs allocated to each Ray task.
@@ -129,6 +136,7 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         mig_frac: float = 0.05,
         crossover_prob: float = 0.5,
         mut_prob: float = 0.2,
+        variation_mechanism: str = "varAnd",
         frac_elitist: float = 0.0,
         overlapping_generation: bool = False,
         common_data: Dict | None = None,
@@ -140,6 +148,9 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         num_best_inds_str: int = 1,
         save_best_individual: bool = False,
         save_train_fit_history: bool = False,
+        save_detailed_log: bool = False,
+        detailed_log_filename: str = "population_detailed_log.csv",
+        early_stop_fitness_threshold: float | None = None,
         output_path: str | None = None,
         batch_size: int = 1,
         num_cpus: int = 1,
@@ -160,6 +171,9 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         self.callback_func = callback_func
         self.save_best_individual = save_best_individual
         self.save_train_fit_history = save_train_fit_history
+        self.save_detailed_log = save_detailed_log
+        self.detailed_log_filename = detailed_log_filename
+        self.early_stop_fitness_threshold = early_stop_fitness_threshold
         self.output_path = output_path
         self.batch_size = batch_size
 
@@ -170,6 +184,7 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         self.num_islands = num_islands
         self.crossover_prob = crossover_prob
         self.mut_prob = mut_prob
+        self.variation_mechanism = variation_mechanism
         self.select_fun = select_fun
         self.select_args = select_args
         self.mut_fun = mut_fun
@@ -681,16 +696,33 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
 
             # Apply crossover and mutation to the offspring with elitism
             elite_inds[i] = tools.selBest(offsprings[i], self.n_elitist)
-            offsprings[i] = elite_inds[i] + algorithms.varOr(
-                offsprings[i],
-                toolbox,
-                self.num_individuals - self.n_elitist,
-                self.crossover_prob,
-                self.mut_prob,
-            )
+            variation_mechanism_norm = str(self.variation_mechanism).lower()
+            if variation_mechanism_norm == "varand":
+                varied_offspring = algorithms.varAnd(
+                    offsprings[i][: self.num_individuals - self.n_elitist],
+                    toolbox,
+                    self.crossover_prob,
+                    self.mut_prob,
+                )
+            elif variation_mechanism_norm == "varor":
+                varied_offspring = algorithms.varOr(
+                    offsprings[i],
+                    toolbox,
+                    self.num_individuals - self.n_elitist,
+                    self.crossover_prob,
+                    self.mut_prob,
+                )
+            else:
+                raise ValueError(
+                    "variation_mechanism must be either 'varAnd' or 'varOr'. "
+                    f"Got: {self.variation_mechanism}"
+                )
+            offsprings[i] = elite_inds[i] + varied_offspring
 
             # add individuals subject to cross-over and mutation to the list of invalids
             invalid_inds[i] = [ind for ind in offsprings[i] if not ind.fitness.valid]
+            for ind in invalid_inds[i]:
+                ind._newborn = True
 
             num_evals += len(invalid_inds[i])
 
@@ -721,6 +753,15 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
                 self.__pop[i] = tools.selBest(
                     self.__pop[i] + offsprings[i], self.num_individuals
                 )
+
+            # Update individual ages after survival.
+            for ind in self.__pop[i]:
+                if getattr(ind, "_newborn", False):
+                    ind.age = 0
+                else:
+                    ind.age = getattr(ind, "age", 0) + 1
+                if hasattr(ind, "_newborn"):
+                    delattr(ind, "_newborn")
 
         # migrations among islands
         if cgen % self.mig_frac == 0 and self.num_islands > 1:
@@ -776,6 +817,20 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         best_inds = tools.selBest(self.__flatten_list(self.__pop), k=n_ind)
         return best_inds[:n_ind]
 
+    def get_population_individuals(self, by_island: bool = False):
+        """Returns individuals from the current population.
+
+        Args:
+            by_island: if True, return a list of populations (one per island);
+                otherwise return a single flattened list.
+
+        Returns:
+            current population individuals.
+        """
+        if by_island:
+            return self.__pop
+        return self.__flatten_list(self.__pop)
+
     def _step(self, toolbox: base.Toolbox, cgen: int):
         """Performs a single step of the evolution pipeline.
 
@@ -818,12 +873,15 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
             save_best_inds: whether to keep the best individual from each island
                 in the new population. Defaults to True.
         """
-        best_inds = [None] * self.num_islands
-        for i in range(self.num_islands):
-            best_inds[i] = tools.selBest(self.__pop[i], k=1)[0]
+        best_inds = None
+        if save_best_inds:
+            best_inds = [None] * self.num_islands
+            for i in range(self.num_islands):
+                best_inds[i] = tools.selBest(self.__pop[i], k=1)[0]
         self._generate_init_pop(toolbox)
-        for i in range(self.num_islands):
-            self.__pop[i][0] = best_inds[i]
+        if save_best_inds and best_inds is not None:
+            for i in range(self.num_islands):
+                self.__pop[i][0] = best_inds[i]
 
     def _generate_init_pop(self, toolbox: base.Toolbox):
         """Generates the initial population.
@@ -834,6 +892,8 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         self.__pop = [None] * self.num_islands
         for i in range(self.num_islands):
             self.__pop[i] = toolbox.population(n=self.num_individuals)
+            for ind in self.__pop[i]:
+                ind.age = 0
 
         # Seeds the first island with individuals
         if self.seed_str is not None:
@@ -876,10 +936,17 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
         self._generate_init_pop(toolbox)
         self.__print("DONE.")
 
+        if self.save_detailed_log and self.output_path is not None:
+            os.makedirs(self.output_path, exist_ok=True)
+            self.__init_detailed_log_file(self.output_path)
+
         # Evaluate the fitness of the entire population on the training set
         self.__print("Evaluating initial population(s)...")
         self._evaluate_init_pop(toolbox)
         self.__print("DONE.")
+        if self.save_detailed_log and self.output_path is not None:
+            # Generation 0 corresponds to the initialized-and-evaluated populations.
+            self.__append_detailed_log(generation=0)
 
         if self.validate:
             self.__print("Using validation dataset.")
@@ -891,9 +958,20 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
 
             self._step(toolbox, self.__cgen)
 
-            if self._best.fitness.values[0] <= 1e-15:
-                self.__print("Fitness threshold reached - STOPPING.")
+            if (
+                self.early_stop_fitness_threshold is not None
+                and self._best.fitness.valid
+                and len(self._best.fitness.values) > 0
+                and self._best.fitness.values[0] <= self.early_stop_fitness_threshold
+            ):
+                self.__print(
+                    "Early stopping: best fitness "
+                    f"{self._best.fitness.values[0]} <= threshold "
+                    f"{self.early_stop_fitness_threshold}."
+                )
                 break
+            if self.save_detailed_log and self.output_path is not None:
+                self.__append_detailed_log(generation=self.__cgen)
 
         self.__print(" -= END OF EVOLUTION =- ")
 
@@ -918,6 +996,12 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
             self.__save_train_fit_history(self.output_path)
             self.__print("Training fitness history saved to disk.")
 
+        if self.save_detailed_log and self.output_path is not None:
+            self.__print(
+                f"Detailed population log saved to "
+                f"{join(self.output_path, self.detailed_log_filename)}."
+            )
+
         # NOTE: ray.shutdown should be manually called by the user
 
     def __save_best_individual(self, output_path: str):
@@ -941,6 +1025,39 @@ class GPSymbolicRegressor(RegressorMixin, BaseEstimator):
             np.save(
                 join(output_path, "val_score_history.npy"), self.__val_score_history
             )
+
+    def __init_detailed_log_file(self, output_path: str):
+        """Initializes the CSV file used for detailed population logging."""
+        path = join(output_path, self.detailed_log_filename)
+        with open(path, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                ["generation", "island", "individual_idx", "length", "fitness", "expr"]
+            )
+
+    def __append_detailed_log(self, generation: int):
+        """Appends one snapshot of all islands/populations to the detailed log."""
+        if self.output_path is None:
+            return
+        path = join(self.output_path, self.detailed_log_filename)
+        with open(path, "a", newline="") as file:
+            writer = csv.writer(file)
+            for island_idx, island_pop in enumerate(self.__pop):
+                for individual_idx, ind in enumerate(island_pop):
+                    if ind.fitness.valid and len(ind.fitness.values) > 0:
+                        fit = float(ind.fitness.values[0])
+                    else:
+                        fit = np.nan
+                    writer.writerow(
+                        [
+                            generation,
+                            island_idx,
+                            individual_idx,
+                            len(ind),
+                            fit,
+                            str(ind),
+                        ]
+                    )
 
     def get_best_individuals_sympy(
         self,
