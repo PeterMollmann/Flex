@@ -19,6 +19,8 @@ numpy_primitives = {
         lambda x, k: np.pow(np.abs(x), k), [float, float], float
     ),
     "sqrt": PrimitiveParams(np.sqrt, [float], float),
+    "sqrt_abs": PrimitiveParams(lambda x: np.sqrt(np.abs(x)), [float], float),
+    "cbrt": PrimitiveParams(np.cbrt, [float], float),
     "square": PrimitiveParams(np.square, [float], float),
     "aq": PrimitiveParams(
         lambda x, y: np.divide(x, np.sqrt(1 + y**2)), [float, float], float
@@ -36,5 +38,7 @@ conversion_rules = {
     "aq": lambda *args_: "Mul({}, Pow(Add(1, Pow({}, 2)), -1/2))".format(*args_),
     "prot_pow": lambda *args_: "Pow(Abs({}), {})".format(*args_),
     "prot_log": lambda *args_: "log(Abs({}))".format(*args_),
+    "sqrt_abs": lambda *args_: "sqrt(Abs({}))".format(*args_),
+    "cbrt": lambda *args_: "sign({0})*Abs({0})**(1/3)".format(*args_),
     "log": lambda *args_: "log({})".format(*args_),
 }
